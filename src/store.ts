@@ -1,17 +1,18 @@
 import { defineStore } from 'pinia';
+import type { Token } from './api';
+import {
+  THEMES,
+  cloneTokens,
+  describeError,
+  migrateToken,
+  migrateTokens,
+  parseRef,
+  resolveThemes,
+  tokenEqual,
+  type ResolutionError
+} from './resolver';
 
-export type TokenCategory = 'color' | 'font' | 'spacing' | 'radius' | 'shadow' | 'component';
-export type Token = {
-  id: string;
-  name: string;
-  category: TokenCategory;
-  value: string;
-  ref?: string;
-  themes: Record<string, string>;
-  usage: number;
-  status: 'stable' | 'deprecated' | 'proposed';
-  description: string;
-};
+export type TokenCategory = Token['category'];
 
 export type ChangeRequest = {
   id: string;
@@ -21,6 +22,23 @@ export type ChangeRequest = {
   impact: number;
   status: '待评审' | '已接受' | '已退回';
   diff: { token: string; before: string; after: string };
+};
+
+export type TokenConflict = {
+  id: string;
+  name: string;
+  local: Token;
+  remote: Token;
+  base?: Token;
+};
+
+export type DiffRow = {
+  id: string;
+  tokenId: string;
+  name: string;
+  theme: string;
+  before: string;
+  after: string;
 };
 
 const initialTokens: Token[] = [
@@ -51,9 +69,25 @@ const storageKey = 'yy63-token-governance';
 const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(storageKey) : null;
 const saved = raw ? JSON.parse(raw) : null;
 
+const loadedTokens: Token[] = saved?.tokens ? migrateTokens(saved.tokens) : migrateTokens(initialTokens);
+const baselineTokens: Token[] = saved?.baselineTokens ? migrateTokens(saved.baselineTokens) : cloneTokens(initialTokens);
+const syncedSnapshot: Token[] = saved?.syncedSnapshot ? migrateTokens(saved.syncedSnapshot) : cloneTokens(initialTokens);
+
+function cloneResolved(resolved: Record<string, Record<string, string>>): Record<string, Record<string, string>> {
+  const result: Record<string, Record<string, string>> = {};
+  for (const [tokenId, themes] of Object.entries(resolved)) {
+    result[tokenId] = { ...themes };
+  }
+  return result;
+}
+
+const baselineResolved: Record<string, Record<string, string>> = saved?.baselineResolved
+  ? cloneResolved(saved.baselineResolved)
+  : cloneResolved(resolveThemes(baselineTokens).values);
+
 export const useTokenStore = defineStore('tokens', {
   state: () => ({
-    tokens: (saved?.tokens as Token[]) ?? initialTokens,
+    tokens: loadedTokens,
     changes: (saved?.changes as ChangeRequest[]) ?? changes,
     activeTheme: (saved?.activeTheme as string) ?? 'light',
     selectedTokenId: (saved?.selectedTokenId as string) ?? 'color.semantic.primary',
@@ -62,7 +96,15 @@ export const useTokenStore = defineStore('tokens', {
     releaseVersion: '4.6.0-rc.2',
     locked: (saved?.locked as boolean) ?? false,
     lastPublished: (saved?.lastPublished as string) ?? 'DS 4.5.2',
-    baseline: initialTokens.map((token) => ({ id: token.id, value: token.value }))
+    baselineTokens,
+    baselineResolved,
+    remoteTokens: (saved?.remoteTokens as Token[] | undefined) ?? null,
+    syncedSnapshot,
+    mergeStatus: (saved?.mergeStatus as string) ?? 'idle',
+    mergeConflicts: (saved?.mergeConflicts as TokenConflict[]) ?? [],
+    mergeError: (saved?.mergeError as string | null) ?? null,
+    mergeApplied: 0,
+    publishError: (saved?.publishError as string | null) ?? null
   }),
   getters: {
     selectedToken(state): Token | undefined {
@@ -76,46 +118,54 @@ export const useTokenStore = defineStore('tokens', {
         return matchesSearch && matchesCategory;
       });
     },
+    resolutionErrors(state): ResolutionError[] {
+      return resolveThemes(state.tokens).errors;
+    },
+    resolvedValues(state): Record<string, Record<string, string>> {
+      return resolveThemes(state.tokens).values;
+    },
     dependencyEdges(state) {
       return state.tokens.filter((token) => token.ref).map((token) => ({ from: token.ref!, to: token.id }));
     },
-    cycleNodes(state): string[] {
-      const graph = new Map<string, string>();
-      state.tokens.filter((token) => token.ref).forEach((token) => graph.set(token.id, token.ref!));
-      const cycle = new Set<string>();
-      graph.forEach((_, start) => {
-        const path: string[] = [];
-        let current: string | undefined = start;
-        while (current && !path.includes(current)) {
-          path.push(current);
-          current = graph.get(current);
-        }
-        if (current && path.includes(current)) path.slice(path.indexOf(current)).forEach((id) => cycle.add(id));
-      });
-      return [...cycle];
+    cycleNodes(): string[] {
+      const ids = new Set<string>();
+      for (const error of this.resolutionErrors) {
+        if (error.kind === 'cycle') ids.add(error.token);
+      }
+      return [...ids];
     },
-    invalidReferences(state) {
-      const ids = new Set(state.tokens.map((token) => token.id));
-      return state.tokens.filter((token) => token.ref && !ids.has(token.ref));
+    invalidReferences(state): Token[] {
+      const ids = new Set<string>();
+      for (const error of this.resolutionErrors) {
+        if (error.kind === 'missing' && error.ref) ids.add(error.token);
+      }
+      return state.tokens.filter((token) => ids.has(token.id));
     },
-    contrastIssues(state) {
+    contrastIssues(state): { title: string; detail: string }[] {
       const text = state.tokens.find((token) => token.id === 'color.text.primary');
       const surface = state.tokens.find((token) => token.id === 'color.surface.canvas');
-      const values = [text?.themes[state.activeTheme], surface?.themes[state.activeTheme]].filter(Boolean) as string[];
+      const values = [
+        text ? this.resolvedValues[text.id]?.[state.activeTheme] : undefined,
+        surface ? this.resolvedValues[surface.id]?.[state.activeTheme] : undefined
+      ].filter(Boolean) as string[];
       if (values.length < 2) return [];
       const ratio = contrastRatio(values[0], values[1]);
       return ratio < 4.5 ? [{ title: '正文与页面背景对比度不足', detail: `当前 ${ratio.toFixed(2)}:1，要求至少 4.5:1。` }] : [];
     },
-    diffRows(state) {
-      return state.tokens.filter((token) => {
-        const base = state.baseline.find((item) => item.id === token.id);
-        return !base || base.value !== token.value;
-      }).map((token) => {
-        const base = state.baseline.find((item) => item.id === token.id);
-        return { id: token.id, before: base?.value ?? '新增', after: token.value, name: token.name };
-      });
+    diffRows(state): DiffRow[] {
+      const rows: DiffRow[] = [];
+      for (const token of state.tokens) {
+        for (const theme of THEMES) {
+          const current = this.resolvedValues[token.id]?.[theme];
+          const base = state.baselineResolved[token.id]?.[theme];
+          if (current !== base) {
+            rows.push({ id: `${token.id}@@${theme}`, tokenId: token.id, name: token.name, theme, before: base ?? '新增', after: current ?? '—' });
+          }
+        }
+      }
+      return rows;
     },
-    releaseReadiness(state): number {
+    releaseReadiness(): number {
       const base = 100 - this.cycleNodes.length * 25 - this.invalidReferences.length * 20 - this.contrastIssues.length * 15;
       return Math.max(0, base);
     }
@@ -125,17 +175,41 @@ export const useTokenStore = defineStore('tokens', {
       this.selectedTokenId = id;
       this.persist();
     },
+    syncDerived(token: Token) {
+      token.ref = parseRef(token.themes.light) ?? undefined;
+    },
     updateTokenValue(id: string, value: string) {
       const token = this.tokens.find((item) => item.id === id);
       if (!token) return;
-      token.value = value;
       token.themes[this.activeTheme] = value;
-      if (value.startsWith('{') && value.endsWith('}')) token.ref = value.slice(1, -1);
-      else delete token.ref;
+      if (this.activeTheme === 'light') token.value = value;
+      this.syncDerived(token);
+      this.persist();
+    },
+    updateToken(id: string, patch: Partial<Token>) {
+      const token = this.tokens.find((item) => item.id === id);
+      if (!token) return;
+      if (patch.themes) token.themes = { ...token.themes, ...patch.themes };
+      if (patch.value !== undefined) {
+        token.value = patch.value;
+        token.themes.light = patch.value;
+      } else {
+        token.value = token.themes.light ?? token.value;
+      }
+      if (patch.name !== undefined) token.name = patch.name;
+      if (patch.category !== undefined) token.category = patch.category;
+      if (patch.usage !== undefined) token.usage = patch.usage;
+      if (patch.status !== undefined) token.status = patch.status;
+      if (patch.description !== undefined) token.description = patch.description;
+      this.syncDerived(token);
       this.persist();
     },
     addToken(token: Token) {
-      if (!this.tokens.some((item) => item.id === token.id)) this.tokens.push(token);
+      if (!this.tokens.some((item) => item.id === token.id)) {
+        const migrated = migrateToken(token);
+        this.syncDerived(migrated);
+        this.tokens.push(migrated);
+      }
       this.persist();
     },
     setTheme(theme: string) {
@@ -158,21 +232,142 @@ export const useTokenStore = defineStore('tokens', {
       this.persist();
     },
     rollback() {
-      this.baseline.forEach((base) => {
-        const token = this.tokens.find((item) => item.id === base.id);
-        if (token) token.value = base.value;
-      });
+      this.tokens = cloneTokens(this.baselineTokens);
       this.persist();
     },
-    lockRelease() {
-      if (this.cycleNodes.length === 0 && this.invalidReferences.length === 0 && this.contrastIssues.length === 0 && this.changes.every((item) => item.status !== '待评审')) {
-        this.locked = true;
-        this.lastPublished = `DS ${this.releaseVersion}`;
+    lockRelease(): { ok: boolean; error?: string } {
+      if (this.resolutionErrors.length > 0) {
+        const error = this.resolutionErrors[0];
+        this.publishError = `发布被阻止：${describeError(error)}。请修复引用后再发布。`;
+        return { ok: false, error: this.publishError };
+      }
+      if (this.contrastIssues.length > 0) {
+        this.publishError = `发布被阻止：${this.contrastIssues[0].detail}`;
+        return { ok: false, error: this.publishError };
+      }
+      if (this.changes.some((item) => item.status === '待评审')) {
+        this.publishError = '发布被阻止：仍有变更请求未处理。';
+        return { ok: false, error: this.publishError };
+      }
+      this.locked = true;
+      this.lastPublished = `DS ${this.releaseVersion}`;
+      this.baselineTokens = cloneTokens(this.tokens);
+      this.baselineResolved = cloneResolved(this.resolvedValues);
+      this.publishError = null;
+      this.persist();
+      return { ok: true };
+    },
+    mergeWithRemote(remoteTokens: Token[]): { ok: boolean; error?: string } {
+      this.mergeStatus = 'merging';
+      this.mergeError = null;
+      this.mergeApplied = 0;
+      try {
+        const remote = migrateTokens(remoteTokens);
+        this.remoteTokens = remote;
+        const base = this.syncedSnapshot;
+        const conflicts: TokenConflict[] = [];
+        const merged: Token[] = [];
+        const remoteIds = new Set(remote.map((token) => token.id));
+        let applied = 0;
+
+        for (const remoteToken of remote) {
+          const local = this.tokens.find((token) => token.id === remoteToken.id);
+          const baseToken = base.find((token) => token.id === remoteToken.id);
+          if (!local) {
+            merged.push(remoteToken);
+            applied += 1;
+            continue;
+          }
+          const localChanged = !baseToken || !tokenEqual(local, baseToken);
+          const remoteChanged = !baseToken || !tokenEqual(remoteToken, baseToken);
+          if (localChanged && remoteChanged) {
+            conflicts.push({
+              id: remoteToken.id,
+              name: remoteToken.name,
+              local: cloneTokens([local])[0],
+              remote: cloneTokens([remoteToken])[0],
+              base: baseToken ? cloneTokens([baseToken])[0] : undefined
+            });
+            merged.push(local);
+          } else if (remoteChanged) {
+            merged.push(remoteToken);
+            applied += 1;
+          } else {
+            merged.push(local);
+          }
+        }
+        for (const local of this.tokens) {
+          if (!remoteIds.has(local.id)) merged.push(local);
+        }
+
+        this.mergeConflicts = conflicts;
+        this.tokens = merged;
+        this.mergeApplied = applied;
+        if (conflicts.length > 0) {
+          this.mergeStatus = 'conflict';
+          return { ok: false, error: `检测到 ${conflicts.length} 个令牌在离线期间被两边修改，已保留两边原值。` };
+        }
+        this.mergeStatus = 'merged';
+        this.syncedSnapshot = cloneTokens(merged);
+        this.persist();
+        return { ok: true };
+      } catch (err) {
+        this.mergeStatus = 'failed';
+        this.mergeError = err instanceof Error ? err.message : String(err);
+        this.persist();
+        return { ok: false, error: this.mergeError };
+      }
+    },
+    retryMerge(): { ok: boolean; error?: string } {
+      if (!this.remoteTokens) {
+        this.mergeStatus = 'failed';
+        this.mergeError = '远端令牌清单不可用，无法重试合并。';
+        this.persist();
+        return { ok: false, error: this.mergeError };
+      }
+      return this.mergeWithRemote(this.remoteTokens);
+    },
+    resolveConflict(id: string, choice: 'local' | 'remote') {
+      const conflict = this.mergeConflicts.find((item) => item.id === id);
+      if (!conflict) return;
+      if (choice === 'remote') {
+        const index = this.tokens.findIndex((item) => item.id === id);
+        if (index >= 0) this.tokens[index] = cloneTokens([conflict.remote])[0];
+      }
+      this.mergeConflicts = this.mergeConflicts.filter((item) => item.id !== id);
+      if (this.mergeConflicts.length === 0) {
+        this.mergeStatus = 'merged';
+        this.syncedSnapshot = cloneTokens(this.tokens);
       }
       this.persist();
     },
+    dismissMerge() {
+      this.mergeStatus = 'idle';
+      this.mergeConflicts = [];
+      this.mergeError = null;
+      this.persist();
+    },
     persist() {
-      if (typeof localStorage !== 'undefined') localStorage.setItem(storageKey, JSON.stringify({ tokens: this.tokens, changes: this.changes, activeTheme: this.activeTheme, selectedTokenId: this.selectedTokenId, search: this.search, category: this.category, locked: this.locked, lastPublished: this.lastPublished }));
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem(storageKey, JSON.stringify({
+          tokens: this.tokens,
+          changes: this.changes,
+          activeTheme: this.activeTheme,
+          selectedTokenId: this.selectedTokenId,
+          search: this.search,
+          category: this.category,
+          locked: this.locked,
+          lastPublished: this.lastPublished,
+          baselineTokens: this.baselineTokens,
+          baselineResolved: this.baselineResolved,
+          remoteTokens: this.remoteTokens,
+          syncedSnapshot: this.syncedSnapshot,
+          mergeStatus: this.mergeStatus,
+          mergeConflicts: this.mergeConflicts,
+          mergeError: this.mergeError,
+          publishError: this.publishError
+        }));
+      }
     }
   }
 });

@@ -16,6 +16,7 @@ import {
 import TokenEditor from './components/TokenEditor.vue';
 import { fetchTokens, submitRelease, type Token } from './api';
 import { useTokenStore } from './store';
+import { THEME_LABELS, describeError } from './resolver';
 
 const AddButtonIcon = () => h(AddIcon);
 const ArrowRightButtonIcon = () => h(ArrowRightIcon);
@@ -35,6 +36,7 @@ const batchFrom = ref('');
 const batchTo = ref('');
 const releaseDialog = ref(false);
 const newTokenDialog = ref(false);
+const conflictDialog = ref(false);
 const newToken = ref({ id: '', name: '', category: 'color', value: '#2864dc', description: '' });
 const releaseResult = ref('');
 
@@ -47,6 +49,11 @@ const nav = [
 
 const pageTitle = computed(() => nav.find((item) => item.path === route.path)?.label ?? '令牌工作区');
 const selected = computed<Token | undefined>(() => store.selectedToken);
+const selectedResolved = computed(() => {
+  const token = selected.value;
+  if (!token) return '';
+  return store.resolvedValues[token.id]?.[store.activeTheme] ?? token.value;
+});
 const selectedJson = computed(() => selected.value ? JSON.stringify({
   id: selected.value.id,
   name: selected.value.name,
@@ -82,7 +89,12 @@ const releaseMutation = useMutation({
 });
 
 watch(remote, (value) => {
-  if (value && !store.tokens.length) value.tokens.forEach((token) => store.addToken(token));
+  if (value) {
+    const result = store.mergeWithRemote(value.tokens);
+    if (result.ok && store.mergeApplied > 0) {
+      MessagePlugin.success(`已合并 ${store.mergeApplied} 项远端变更`);
+    }
+  }
 });
 
 function go(path: string) {
@@ -92,7 +104,7 @@ function go(path: string) {
 function updateEditor(value: string) {
   try {
     const parsed = JSON.parse(value) as Partial<Token>;
-    if (parsed.value !== undefined) store.updateTokenValue(store.selectedTokenId, parsed.value);
+    if (selected.value) store.updateToken(selected.value.id, parsed);
   } catch {
     // Keep invalid JSON editable; validation is shown in the dependency panel.
   }
@@ -139,10 +151,33 @@ function batchReplace() {
 }
 
 function publish() {
+  const result = store.lockRelease();
+  if (!result.ok) {
+    MessagePlugin.error(result.error || '发布校验未通过');
+    return;
+  }
   const accepted = store.changes.filter((item) => item.status === '已接受').map((item) => item.id);
   releaseMutation.mutate({ version: selectedVersion.value, accepted, actor: '设计系统维护员' });
-  store.lockRelease();
   releaseDialog.value = true;
+}
+
+function retryMerge() {
+  const result = store.retryMerge();
+  if (result.ok) {
+    MessagePlugin.success('合并成功');
+  } else if (store.mergeStatus === 'conflict') {
+    conflictDialog.value = true;
+  } else {
+    MessagePlugin.error(result.error || '合并失败');
+  }
+}
+
+function themeLabel(theme: string) {
+  return THEME_LABELS[theme] ?? theme;
+}
+
+function errorText(error: { token: string; theme: string; kind: 'cycle' | 'missing'; ref?: string; path?: string[] }) {
+  return describeError(error);
 }
 </script>
 
@@ -162,9 +197,22 @@ function publish() {
         <div class="save-state"><t-icon name="cloud-done" /><div><span>草稿已保存</span><small>{{ new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) }}</small></div></div>
       </t-aside>
       <t-content class="main-content">
+        <div v-if="store.mergeStatus === 'conflict' || store.mergeStatus === 'failed'" class="merge-banner" :class="{ failed: store.mergeStatus === 'failed' }">
+          <t-icon :name="store.mergeStatus === 'failed' ? 'error-circle' : 'info-circle'" />
+          <div class="merge-banner-text">
+            <strong>{{ store.mergeStatus === 'failed' ? '合并失败' : '检测到合并冲突' }}</strong>
+            <span>{{ store.mergeStatus === 'failed' ? (store.mergeError || '远端令牌清单合并失败，本地编辑已保留。') : `离线草稿与远端清单合并时，${store.mergeConflicts.length} 个令牌被两边修改，已保留两边原值。` }}</span>
+          </div>
+          <div class="merge-banner-actions">
+            <t-button v-if="store.mergeStatus === 'conflict'" size="small" variant="outline" @click="conflictDialog = true">查看冲突</t-button>
+            <t-button size="small" theme="primary" @click="retryMerge">重试合并</t-button>
+            <t-button size="small" variant="text" @click="store.dismissMerge()">稍后</t-button>
+          </div>
+        </div>
+
         <header class="page-heading">
           <div><small>{{ store.locked ? 'RELEASE LOCKED' : 'GOVERNANCE WORKBENCH' }} / {{ pageTitle }}</small><h1>{{ pageTitle }}</h1><p>基础令牌到语义令牌的引用、差异、校验与跨主题发布。</p></div>
-          <div class="heading-actions"><t-select v-model="store.activeTheme" style="width: 150px" :options="[{label:'明亮模式',value:'light'},{label:'暗色模式',value:'dark'},{label:'运营模式',value:'ops'},{label:'高对比度',value:'contrast'}]" /><t-button variant="outline" :icon="AddButtonIcon" @click="newTokenDialog = true">新建令牌</t-button><t-button theme="primary" :icon="LockButtonIcon" :disabled="store.locked" @click="publish">发布主题</t-button></div>
+          <div class="heading-actions"><t-select v-model="store.activeTheme" style="width: 150px" :options="[{label:'明亮模式',value:'light'},{label:'暗色模式',value:'dark'},{label:'运营模式',value:'ops'},{label:'高对比度',value:'contrast'}]" /><t-button variant="outline" :icon="AddButtonIcon" @click="newTokenDialog = true">新建令牌</t-button><t-button theme="primary" :icon="LockButtonIcon" :disabled="store.locked || store.resolutionErrors.length > 0 || store.changes.some(c => c.status === '待评审')" @click="publish">发布主题</t-button></div>
         </header>
 
         <section v-if="route.path === '/'" class="token-workspace">
@@ -182,19 +230,19 @@ function publish() {
           </aside>
           <section class="editor-column">
             <div class="panel editor-panel">
-              <div class="panel-head"><div><strong>Monaco 令牌编辑</strong><span>{{ selected?.id }} · {{ store.activeTheme }}</span></div><div class="editor-actions"><t-tag v-if="selected?.ref" variant="light">引用 {{ selected.ref }}</t-tag><t-button size="small" variant="outline" :icon="CopyButtonIcon">复制 JSON</t-button></div></div>
+              <div class="panel-head"><div><strong>Monaco 令牌编辑</strong><span>{{ selected?.id }} · {{ themeLabel(store.activeTheme) }}</span></div><div class="editor-actions"><t-tag v-if="selected?.ref" variant="light">引用 {{ selected.ref }}</t-tag><t-button size="small" variant="outline" :icon="CopyButtonIcon">复制 JSON</t-button></div></div>
               <div class="editor-host"><TokenEditor :model-value="selectedJson" language="json" @update:model-value="updateEditor" /></div>
-              <div class="editor-status"><span><i class="status-dot" />JSON 结构有效</span><span>引用关系 {{ store.dependencyEdges.length }} 条</span><span>{{ selected?.usage }} 处产品引用</span></div>
+              <div class="editor-status"><span><i class="status-dot" />JSON 结构有效</span><span>引用关系 {{ store.dependencyEdges.length }} 条</span><span>解析值 {{ selectedResolved }}</span><span>{{ selected?.usage }} 处产品引用</span></div>
             </div>
             <div class="panel batch-panel"><div class="panel-head"><div><strong>批量替换</strong><span>跨主题替换相同原始值</span></div><SwapIcon /></div><div class="batch-form"><t-input v-model="batchFrom" placeholder="原始值，如 #2864dc" /><ArrowRightIcon /><t-input v-model="batchTo" placeholder="新值" /><t-button theme="primary" :disabled="!batchFrom || !batchTo" @click="batchReplace">执行替换</t-button></div></div>
           </section>
           <aside class="preview-column">
             <div class="panel preview-panel">
-              <div class="panel-head"><div><strong>组件预览</strong><span>实时应用当前主题</span></div><t-tag theme="success" variant="light">可渲染</t-tag></div>
-              <div class="component-preview" :style="{ background: selected?.category === 'color' ? selected.value : undefined }">
+              <div class="panel-head"><div><strong>组件预览</strong><span>实时应用{{ themeLabel(store.activeTheme) }}解析值</span></div><t-tag theme="success" variant="light">可渲染</t-tag></div>
+              <div class="component-preview" :style="{ background: selected?.category === 'color' ? selectedResolved : undefined }">
                 <div class="mock-app"><div class="mock-sidebar"><i /><i /><i /></div><div class="mock-content"><div class="mock-title" /><div class="mock-card"><span /><span /><span /></div><div class="mock-buttons"><button>取消</button><button>确认提交</button></div></div></div>
               </div>
-              <div class="token-detail"><div><span>当前值</span><strong>{{ selected?.value }}</strong></div><div><span>使用量</span><strong>{{ selected?.usage }} 处</strong></div><div><span>状态</span><strong>{{ selected?.status }}</strong></div><div><span>说明</span><strong>{{ selected?.description }}</strong></div></div>
+              <div class="token-detail"><div><span>当前值</span><strong>{{ selectedResolved }}</strong></div><div><span>使用量</span><strong>{{ selected?.usage }} 处</strong></div><div><span>状态</span><strong>{{ selected?.status }}</strong></div><div><span>说明</span><strong>{{ selected?.description }}</strong></div></div>
             </div>
             <div class="panel validation-summary"><div class="panel-head"><div><strong>快速校验</strong><span>发布前门禁摘要</span></div><strong class="score">{{ store.releaseReadiness }}%</strong></div><div class="summary-row" :class="{ bad: store.cycleNodes.length }"><span>循环依赖</span><strong>{{ store.cycleNodes.length ? `${store.cycleNodes.length} 个节点` : '未发现' }}</strong></div><div class="summary-row" :class="{ bad: store.invalidReferences.length }"><span>无效引用</span><strong>{{ store.invalidReferences.length || '未发现' }}</strong></div><div class="summary-row" :class="{ bad: store.contrastIssues.length }"><span>对比度</span><strong>{{ store.contrastIssues.length ? '需调整' : '符合 AA' }}</strong></div><div class="summary-row"><span>命名冲突</span><strong>未发现</strong></div></div>
           </aside>
@@ -231,21 +279,30 @@ function publish() {
         <section v-else class="publish-page">
           <div class="panel publish-main">
             <div class="panel-head"><div><strong>发布准备</strong><span>生成只读版本，支持回滚到历史基线</span></div><t-tag :theme="store.locked ? 'success' : 'warning'">{{ store.locked ? '已锁定' : '候选版本' }}</t-tag></div>
+            <div v-if="store.publishError" class="publish-error">
+              <t-icon name="error-circle" theme="danger" />
+              <div><strong>发布被阻止</strong><span>{{ store.publishError }}</span></div>
+            </div>
+            <div v-if="store.resolutionErrors.length" class="publish-errors">
+              <div v-for="(error, index) in store.resolutionErrors" :key="index" class="publish-error-row">
+                <t-icon name="error-circle" theme="danger" />
+                <span>{{ errorText(error) }}</span>
+              </div>
+            </div>
             <div class="publish-form">
               <label><span>版本号</span><t-input v-model="selectedVersion" /></label>
               <label><span>目标产品</span><t-select multiple value="['组件库','运营后台','移动端组件']" :options="[{label:'组件库',value:'组件库'},{label:'运营后台',value:'运营后台'},{label:'移动端组件',value:'移动端组件'},{label:'数据平台',value:'数据平台'}]" /></label>
               <label><span>发布说明</span><t-textarea value="更新语义主色、统一控件圆角，并修复暗色主题正文对比度。" :autosize="{ minRows: 3 }" /></label>
             </div>
             <div class="release-checks">
-              <label><t-checkbox checked /> 循环依赖检查通过</label>
-              <label><t-checkbox checked /> 无效引用检查通过</label>
+              <label><t-checkbox :checked="store.resolutionErrors.length === 0" /> 循环与缺失引用检查通过</label>
               <label><t-checkbox :checked="store.contrastIssues.length === 0" /> 颜色对比度符合 WCAG AA</label>
               <label><t-checkbox :checked="store.changes.every(c => c.status !== '待评审')" /> 所有变更请求已处理</label>
             </div>
-            <div class="publish-actions"><t-button variant="outline" @click="store.rollback">回滚全部未发布编辑</t-button><t-button theme="primary" icon="lock-on" :disabled="store.locked || store.changes.some(c => c.status === '待评审')" @click="publish">校验并锁定发布</t-button></div>
+            <div class="publish-actions"><t-button variant="outline" @click="store.rollback">回滚全部未发布编辑</t-button><t-button theme="primary" icon="lock-on" :disabled="store.locked || store.resolutionErrors.length > 0 || store.changes.some(c => c.status === '待评审')" @click="publish">校验并锁定发布</t-button></div>
           </div>
           <aside class="publish-side">
-            <div class="panel diff-panel"><div class="panel-head"><div><strong>版本差异</strong><span>相对 {{ store.lastPublished }}</span></div><t-tag>{{ store.diffRows.length }} 项</t-tag></div><div v-for="row in store.diffRows" :key="row.id" class="diff-row"><strong>{{ row.name }}</strong><span>{{ row.id }}</span><div><del>{{ row.before }}</del><ins>{{ row.after }}</ins></div></div><p v-if="!store.diffRows.length" class="empty">暂无未发布差异。</p></div>
+            <div class="panel diff-panel"><div class="panel-head"><div><strong>版本差异</strong><span>相对 {{ store.lastPublished }} · 按主题解析值</span></div><t-tag>{{ store.diffRows.length }} 项</t-tag></div><div v-for="row in store.diffRows" :key="row.id" class="diff-row"><strong>{{ row.name }}</strong><span>{{ row.id }} · {{ themeLabel(row.theme) }}</span><div><del>{{ row.before }}</del><ins>{{ row.after }}</ins></div></div><p v-if="!store.diffRows.length" class="empty">暂无未发布差异。</p></div>
             <div class="panel history-panel"><div class="panel-head"><div><strong>发布历史</strong><span>可追溯版本</span></div><HistoryIcon /></div><div class="history-row"><t-tag theme="success" variant="light">当前</t-tag><div><strong>DS {{ store.lastPublished }}</strong><span>顾清 · 09-24 17:20</span></div><t-button size="small" variant="text">查看</t-button></div><div class="history-row"><t-tag>历史</t-tag><div><strong>DS 4.5.1</strong><span>周序 · 09-12 11:04</span></div><t-button size="small" variant="text">回滚</t-button></div><div class="history-row"><t-tag>历史</t-tag><div><strong>DS 4.5.0</strong><span>顾清 · 08-28 15:42</span></div><t-button size="small" variant="text">回滚</t-button></div></div>
           </aside>
         </section>
@@ -257,4 +314,16 @@ function publish() {
     <div class="dialog-form"><t-input v-model="newToken.id" label="令牌 ID" placeholder="product.component.property" /><t-input v-model="newToken.name" label="显示名称" /><t-select v-model="newToken.category" label="分类" :options="[{label:'颜色',value:'color'},{label:'字体',value:'font'},{label:'间距',value:'spacing'},{label:'圆角',value:'radius'},{label:'阴影',value:'shadow'},{label:'组件',value:'component'}]" /><t-input v-model="newToken.value" label="默认值" /><t-textarea v-model="newToken.description" label="用途说明" /></div>
   </t-dialog>
   <t-dialog v-model:visible="releaseDialog" header="主题发布完成" :footer="false"><div class="release-success"><t-icon name="check-circle" size="46px" theme="success" /><h3>DS {{ store.releaseVersion }} 已锁定</h3><p>{{ releaseResult }}</p><p>版本快照已生成，产品使用方可以按固定版本拉取令牌。</p></div></t-dialog>
+  <t-dialog v-model:visible="conflictDialog" header="离线草稿合并冲突" width="720px" :footer="null">
+    <p class="conflict-hint">以下令牌在离线期间被本地草稿与远端清单同时修改，已保留两边原值。请选择采用哪一版，或稍后在令牌树中手动合并。</p>
+    <div v-for="conflict in store.mergeConflicts" :key="conflict.id" class="conflict-card">
+      <div class="conflict-head"><strong>{{ conflict.name }}</strong><span>{{ conflict.id }}</span></div>
+      <div class="conflict-grid">
+        <div class="conflict-col"><span>本地草稿</span><code>{{ conflict.local.themes.light }}</code></div>
+        <div class="conflict-col"><span>远端清单</span><code>{{ conflict.remote.themes.light }}</code></div>
+      </div>
+      <div class="conflict-actions"><t-button size="small" variant="outline" @click="store.resolveConflict(conflict.id, 'local')">保留本地</t-button><t-button size="small" theme="primary" @click="store.resolveConflict(conflict.id, 'remote')">采用远端</t-button></div>
+    </div>
+    <p v-if="!store.mergeConflicts.length" class="empty">所有冲突已处理完毕。</p>
+  </t-dialog>
 </template>
